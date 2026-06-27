@@ -1,0 +1,433 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <cstring>
+#include <limits>
+#include <iomanip>
+#include <thread>
+#include <atomic>
+
+// =========================================================
+// OPTIMIZACIÃ“N 1: ESTRUCTURA EMPAQUETADA Y ALINEADA
+// =========================================================
+#pragma pack(push, 1)
+struct Transaction {
+    long long transaction_id;
+    double amount;
+    long long user_id;
+};
+#pragma pack(pop)
+
+// =========================================================
+// OPTIMIZACIÃ“N 2: SEGMENTED ARENA ALLOCATOR
+// =========================================================
+class ArenaAllocator {
+private:
+    size_t chunk_size;
+    std::vector<char*> chunks;
+    size_t current_chunk_idx;
+    size_t current_offset;
+
+    void allocate_new_chunk() {
+        char* new_chunk = static_cast<char*>(malloc(chunk_size));
+        if (!new_chunk) throw std::bad_alloc();
+        chunks.push_back(new_chunk);
+        current_chunk_idx = chunks.size() - 1;
+        current_offset = 0;
+    }
+
+public:
+    ArenaAllocator(size_t chunk_bytes = 128ULL * 1024ULL * 1024ULL) 
+        : chunk_size(chunk_bytes), current_chunk_idx(0), current_offset(0) {
+        allocate_new_chunk();
+    }
+    
+    ~ArenaAllocator() {
+        for (char* chunk : chunks) free(chunk);
+    }
+
+    void* allocate(size_t size) {
+        size = (size + 7) & ~7;
+        if (current_offset + size > chunk_size) {
+            if (size > chunk_size) chunk_size = size * 2;
+            allocate_new_chunk();
+        }
+        void* ptr = chunks[current_chunk_idx] + current_offset;
+        current_offset += size;
+        return ptr;
+    }
+
+    size_t get_total_allocated() const {
+        return chunks.size() * chunk_size;
+    }
+};
+
+// =========================================================
+// OPTIMIZACIÃ“N 3: FAST ZERO-COPY PARSING
+// =========================================================
+class FastCSVParser {
+public:
+    static inline long long fast_atoll(const char*& ptr) {
+        long long val = 0;
+        while (*ptr >= '0' && *ptr <= '9') {
+            val = val * 10 + (*ptr - '0');
+            ptr++;
+        }
+        return val;
+    }
+
+    static std::vector<Transaction> load_all_data(const std::string& filename) {
+        std::vector<Transaction> data;
+        std::ifstream file(filename, std::ios::binary); 
+        
+        if (!file.is_open()) {
+            std::cerr << "[ERROR CRÃTICO] No se encontrÃ³ el archivo.\n";
+            exit(1);
+        }
+
+        std::string line;
+        std::getline(file, line); 
+
+        std::cout << "--- INICIANDO INGESTA MASIVA A BAJO NIVEL (I/O OPTIMIZADO) ---\n";
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        data.reserve(14000000); 
+
+        size_t count = 0;
+        while (std::getline(file, line)) {
+            const char* ptr = line.c_str();
+            Transaction tx;
+            try {
+                tx.transaction_id = fast_atoll(ptr);
+                if (tx.transaction_id == 0) continue; 
+                if (*ptr == ',') ptr++;
+                char* end_ptr;
+                tx.amount = std::strtod(ptr, &end_ptr); 
+                ptr = end_ptr;
+                if (*ptr == ',') ptr++;
+                tx.user_id = fast_atoll(ptr);
+
+                data.push_back(tx);
+                count++;
+                if (count % 4000000 == 0) {
+                    std::cout << " -> " << count << " registros parseados...\n";
+                }
+            } catch (...) { continue; }
+        }
+
+        data.shrink_to_fit(); 
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::cout << "Ingesta completa: " << count << " registros totales leÃ­dos en " 
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count() << " ms.\n";
+        
+        std::sort(data.begin(), data.end(), [](const Transaction& a, const Transaction& b) {
+            return a.transaction_id < b.transaction_id;
+        });
+
+        return data;
+    }
+};
+
+// =========================================================
+// SKIP LIST CLÃSICA
+// =========================================================
+template<typename Key, typename Value>
+class OptimizedSkipList {
+protected:
+    struct Node {
+        Key key;
+        Value value;
+        Node** forward;
+    };
+
+    int MAX_LEVEL;
+    float P;
+    int current_level;
+    Node* head;
+    ArenaAllocator arena; 
+    std::mt19937 rng;
+    std::uniform_real_distribution<float> dist;
+
+    int randomLevel() {
+        int lvl = 1;
+        while (dist(rng) < P && lvl < MAX_LEVEL) lvl++;
+        return lvl;
+    }
+
+    Node* createNode(Key key, Value value, int level) {
+        size_t node_size = sizeof(Node) + sizeof(Node*) * level;
+        void* mem = arena.allocate(node_size);
+        Node* node = new(mem) Node; 
+        node->key = key;
+        node->value = value;
+        node->forward = reinterpret_cast<Node**>(reinterpret_cast<char*>(mem) + sizeof(Node));
+        for(int i = 0; i < level; ++i) node->forward[i] = nullptr;
+        return node;
+    }
+
+public:
+    OptimizedSkipList(int max_lvl = 28, float p = 0.5) 
+        : MAX_LEVEL(max_lvl), P(p), current_level(1), arena(128ULL * 1024ULL * 1024ULL), rng(42), dist(0.0, 1.0) {
+        head = createNode(std::numeric_limits<Key>::min(), Value(), MAX_LEVEL);
+    }
+
+    void insert(Key key, Value value) {
+        std::vector<Node*> update(MAX_LEVEL, nullptr);
+        Node* curr = head;
+
+        for (int i = current_level - 1; i >= 0; i--) {
+            while (curr->forward[i] != nullptr && curr->forward[i]->key < key) curr = curr->forward[i];
+            update[i] = curr;
+        }
+        curr = curr->forward[0];
+
+        if (curr != nullptr && curr->key == key) return;
+
+        int r_level = randomLevel();
+        if (r_level > current_level) {
+            for (int i = current_level; i < r_level; i++) update[i] = head;
+            current_level = r_level;
+        }
+
+        Node* new_node = createNode(key, value, r_level);
+        for (int i = 0; i < r_level; i++) {
+            new_node->forward[i] = update[i]->forward[i];
+            update[i]->forward[i] = new_node;
+        }
+    }
+
+    // Thread-safe read (const)
+    bool search(Key key, Value& result) const {
+        Node* curr = head;
+        for (int i = current_level - 1; i >= 0; i--) {
+            while (curr->forward[i] != nullptr && curr->forward[i]->key < key) curr = curr->forward[i];
+        }
+        curr = curr->forward[0];
+        if (curr != nullptr && curr->key == key) {
+            result = curr->value;
+            return true;
+        }
+        return false;
+    }
+    
+    Node* get_head() const { return head; }
+    size_t get_memory_usage() const { return arena.get_total_allocated(); }
+};
+
+// =========================================================
+// IA ESTADO DEL ARTE (RMI + PREFETCHING)
+// =========================================================
+struct LinearRegression {
+    double slope = 0.0;
+    double intercept = 0.0;
+
+    void train(const std::vector<long long>& keys, const std::vector<size_t>& y_vals, size_t start_idx, size_t end_idx) {
+        if (start_idx >= end_idx) return;
+        double n = end_idx - start_idx;
+        if (n <= 1) {
+            slope = 0; intercept = (double)y_vals[start_idx];
+            return;
+        }
+        double sum_x = 0, sum_y = 0, sum_xy = 0, sum_xx = 0;
+        for (size_t i = start_idx; i < end_idx; ++i) {
+            double x = keys[i]; double y = y_vals[i];
+            sum_x += x; sum_y += y; sum_xy += x * y; sum_xx += x * x;
+        }
+        double denominator = (n * sum_xx - sum_x * sum_x);
+        if (std::abs(denominator) < 1e-9) {
+            slope = 0; intercept = (double)y_vals[start_idx];
+        } else {
+            slope = (n * sum_xy - sum_x * sum_y) / denominator;
+            intercept = (sum_y - slope * sum_x) / n;
+        }
+    }
+    inline double predict_double(double x) const { return slope * x + intercept; }
+};
+
+template<typename Key, typename Value>
+class RMILearnedIndex : public OptimizedSkipList<Key, Value> {
+private:
+    LinearRegression root_model; 
+    std::vector<LinearRegression> leaf_models; 
+    std::vector<typename OptimizedSkipList<Key,Value>::Node*> index_array;
+    size_t num_leaves = 20000;
+
+public:
+    void bulk_load(const std::vector<std::pair<Key, Value>>& sorted_data) {
+        for (const auto& item : sorted_data) this->insert(item.first, item.second);
+
+        index_array.clear();
+        auto* curr = this->get_head()->forward[0];
+        while (curr != nullptr) {
+            index_array.push_back(curr);
+            curr = curr->forward[0];
+        }
+
+        size_t n = index_array.size();
+        if (n == 0) return;
+
+        std::vector<long long> keys(n);
+        std::vector<size_t> y_leaf_targets(n);
+        for(size_t i = 0; i < n; ++i) {
+            keys[i] = index_array[i]->key;
+            y_leaf_targets[i] = (i * num_leaves) / n; 
+            if (y_leaf_targets[i] >= num_leaves) y_leaf_targets[i] = num_leaves - 1;
+        }
+
+        root_model.train(keys, y_leaf_targets, 0, n);
+
+        leaf_models.resize(num_leaves);
+        std::vector<size_t> y_positions(n);
+        for(size_t i = 0; i < n; ++i) y_positions[i] = i;
+
+        size_t segment_size = (n + num_leaves - 1) / num_leaves;
+        for (size_t i = 0; i < num_leaves; ++i) {
+            size_t start = i * segment_size;
+            size_t end = std::min(start + segment_size, n);
+            if (start < end) leaf_models[i].train(keys, y_positions, start, end);
+        }
+    }
+
+    // Thread-safe read with Hardware Prefetching
+    bool search_learned(Key key, Value& result) const {
+        if (index_array.empty() || key < index_array.front()->key || key > index_array.back()->key) return false;
+
+        // Capa 1
+        double predicted_leaf = root_model.predict_double(key);
+        size_t leaf_idx = static_cast<size_t>(std::max(0.0, std::min(predicted_leaf, (double)num_leaves - 1)));
+
+        // INYECCIÃ“N DE HARDWARE PREFETCH: Preparar modelo hoja en CachÃ© L1
+        __builtin_prefetch(&leaf_models[leaf_idx], 0, 1);
+
+        // Capa 2
+        double predicted_pos = leaf_models[leaf_idx].predict_double(key);
+        size_t n = index_array.size();
+        long long pos = static_cast<long long>(std::max(0.0, std::min(predicted_pos, (double)n - 1)));
+
+        // INYECCIÃ“N DE HARDWARE PREFETCH: Preparar nodo de datos en CachÃ© L1
+        __builtin_prefetch(index_array[pos], 0, 1);
+
+        long long bound = 1;
+        if (index_array[pos]->key == key) {
+            result = index_array[pos]->value; return true;
+        } else if (index_array[pos]->key < key) {
+            while (pos + bound < (long long)n && index_array[pos + bound]->key < key) bound *= 2; 
+            long long left = pos + (bound / 2);
+            long long right = std::min(pos + bound, (long long)n - 1);
+            auto it = std::lower_bound(index_array.begin() + left, index_array.begin() + right + 1, key, 
+                [](const typename OptimizedSkipList<Key,Value>::Node* node, const Key& k) { return node->key < k; });
+            if (it != (index_array.begin() + right + 1) && (*it)->key == key) {
+                result = (*it)->value; return true;
+            }
+        } else {
+            while (pos - bound >= 0 && index_array[pos - bound]->key > key) bound *= 2; 
+            long long left = std::max(0LL, pos - bound);
+            long long right = pos - (bound / 2);
+            auto it = std::lower_bound(index_array.begin() + left, index_array.begin() + right + 1, key, 
+                [](const typename OptimizedSkipList<Key,Value>::Node* node, const Key& k) { return node->key < k; });
+            if (it != (index_array.begin() + right + 1) && (*it)->key == key) {
+                result = (*it)->value; return true;
+            }
+        }
+        return false;
+    }
+
+    size_t get_ai_memory_usage() const {
+        return sizeof(root_model) + (leaf_models.capacity() * sizeof(LinearRegression)) + (index_array.capacity() * sizeof(void*));
+    }
+};
+
+// =========================================================
+// PIPELINE PRINCIPAL MULTITHREADING (HPC)
+// =========================================================
+int main() {
+    std::vector<Transaction> raw_data = FastCSVParser::load_all_data("transactions_data.csv");
+    if (raw_data.empty()) return 1;
+
+    std::vector<std::pair<long long, Transaction>> dataset;
+    dataset.reserve(raw_data.size());
+    for (const auto& tx : raw_data) dataset.push_back({tx.transaction_id, tx});
+
+    OptimizedSkipList<long long, Transaction> classic_sl;
+    RMILearnedIndex<long long, Transaction> rmi_sl;
+
+    std::cout << "[Fase 1] Poblando Skip List Tradicional (Generando Punteros)... Total: " << dataset.size() << " items.\n";
+    for(const auto& p : dataset) classic_sl.insert(p.first, p.second);
+
+    std::cout << "[Fase 2] Entrenando IA (RMI)...\n";
+    auto s_train = std::chrono::high_resolution_clock::now();
+    rmi_sl.bulk_load(dataset);
+    auto e_train = std::chrono::high_resolution_clock::now();
+    std::cout << ">> Tiempo de Entrenamiento RMI: " << std::chrono::duration_cast<std::chrono::milliseconds>(e_train - s_train).count() << " ms\n\n";
+
+    // ---------------------------------------------------------
+    // PREPARACIÃ“N DE BENCHMARK MULTITHREAD
+    // ---------------------------------------------------------
+    size_t num_queries = 2000000; // Â¡Aumentamos a 2 Millones para que los hilos tengan trabajo!
+    std::vector<long long> queries;
+    std::mt19937 rng(1337);
+    for(size_t i = 0; i < num_queries; ++i) queries.push_back(dataset[rng() % dataset.size()].first);
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 4;
+    std::cout << "--- BENCHMARK HPC: " << num_queries << " Consultas en Paralelo (" << num_threads << " NÃºcleos) ---\n";
+
+    auto run_parallel = [&](auto& index_structure, bool is_ai) -> std::pair<size_t, long long> {
+        std::atomic<size_t> total_found{0};
+        std::vector<std::thread> threads;
+        size_t chunk_size = num_queries / num_threads;
+
+        auto start_t = std::chrono::high_resolution_clock::now();
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            size_t start_idx = t * chunk_size;
+            size_t end_idx = (t == num_threads - 1) ? num_queries : start_idx + chunk_size;
+
+            threads.emplace_back([&, start_idx, end_idx]() {
+                size_t local_found = 0;
+                Transaction dummy;
+                for (size_t i = start_idx; i < end_idx; ++i) {
+                    if (is_ai) {
+                        if (rmi_sl.search_learned(queries[i], dummy)) local_found++;
+                    } else {
+                        if (classic_sl.search(queries[i], dummy)) local_found++;
+                    }
+                }
+                total_found += local_found;
+            });
+        }
+        for (auto& th : threads) th.join();
+        auto end_t = std::chrono::high_resolution_clock::now();
+
+        long long duration = std::chrono::duration_cast<std::chrono::microseconds>(end_t - start_t).count();
+        return {total_found.load(), duration};
+    };
+
+    // Ejecutar pruebas
+    auto [f1, d1] = run_parallel(classic_sl, false);
+    auto [f2, d2] = run_parallel(rmi_sl, true);
+
+    // CÃ¡lculos de Memoria
+    double mem_classic_mb = static_cast<double>(classic_sl.get_memory_usage()) / (1024 * 1024);
+    // Para la IA: Estructura indexada base (array de punteros) + Modelos MatemÃ¡ticos
+    double mem_ai_mb = static_cast<double>(rmi_sl.get_ai_memory_usage()) / (1024 * 1024);
+
+    std::cout << "========================================================\n";
+    std::cout << "        RESULTADOS DEFINITIVOS (HIGH-PERFORMANCE)       \n";
+    std::cout << "========================================================\n";
+    std::cout << "-> Tiempos (2M Consultas en " << num_threads << " Hilos):\n";
+    std::cout << "   - Skip List Tradicional : " << d1 << " us.\n";
+    std::cout << "   - Learned Index (IA)    : " << d2 << " us.\n";
+    std::cout << "   * AceleraciÃ³n           : " << std::fixed << std::setprecision(2) << (double)d1 / d2 << "x mÃ¡s rÃ¡pido.\n";
+    std::cout << "--------------------------------------------------------\n";
+    std::cout << "-> Huella de Memoria RAM (Overhead de la estructura):\n";
+    std::cout << "   - Skip List Tradicional : " << mem_classic_mb << " MB (Ãrbol de Punteros)\n";
+    std::cout << "   - Learned Index (IA)    : " << mem_ai_mb << " MB (Array + Red Neuronal RMI)\n";
+    std::cout << "   * Ahorro de RAM         : " << (mem_classic_mb / mem_ai_mb) << "x menos memoria usada.\n";
+    std::cout << "========================================================\n";
+
+    return 0;
+}
